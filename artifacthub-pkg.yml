@@ -1,0 +1,18 @@
+version: v0.0.1-alpha
+name: headlamp_vap
+displayName: ValidationAdmissionPolicy Headlamp Plugin
+createdAt:
+description: ValidationAdmissionPolicy editor in Headlamp
+homeURL: https://github.com/kubebeam/vap-headlamp-plugin
+logoURL:
+links:
+  - name: Headlamp
+    url: https://github.com/headlamp-k8s/headlamp
+  - name: ValidationAdmissionPolicy
+    url: https://kubernetes.io/docs/reference/access-authn-authz/validating-admission-policy/
+
+annotations:
+  headlamp/plugin/archive-url:
+  headlamp/plugin/archive-checksum:
+  headlamp/plugin/version-compat: '>=0.25'
+  headlamp/plugin/distro-compat: in-cluster,web,docker-desktop,desktop
