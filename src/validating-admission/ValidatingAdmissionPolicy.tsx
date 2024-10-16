@@ -1,35 +1,22 @@
 import './wasm_exec.js';
 import './wasmTypes.d.ts';
+import { ApiProxy, KubeObject } from '@kinvolk/headlamp-plugin/lib';
 import { NameValueTable, SectionBox } from '@kinvolk/headlamp-plugin/lib/CommonComponents';
-import { KubeObject } from '@kinvolk/headlamp-plugin/lib/lib/k8s/cluster';
+import Editor from '@monaco-editor/react';
 import * as yaml from 'js-yaml';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { getURLSegments } from '../common/url';
 import { validatingAdmissionPolicyClass } from '../model';
+import { sampleDeployment } from './samples';
 
 export function ValidatingAdmissionPolicy() {
   const [name] = getURLSegments(-1);
-  const [isWasmLoaded, setIsWasmLoaded] = useState(false);
   const [validatingAdmissionPolicyObject, setValidatingAdmissionPolicy] =
     useState<KubeObject>(null);
 
-  useEffect(() => {
-    async function loadWasm(): Promise<void> {
-      const goWasm = new window.Go();
-      const result = await WebAssembly.instantiateStreaming(
-        fetch(`/plugins/vap-plugin/main.wasm`),
-        goWasm.importObject
-      );
-      goWasm.run(result.instance);
-      setIsWasmLoaded(true);
-    }
-
-    loadWasm();
-  }, []);
-
   validatingAdmissionPolicyClass.useApiGet(setValidatingAdmissionPolicy, name);
 
-  if (!validatingAdmissionPolicyObject || !isWasmLoaded) {
+  if (!validatingAdmissionPolicyObject) {
     return <div></div>;
   }
 
@@ -37,10 +24,6 @@ export function ValidatingAdmissionPolicy() {
 
   return (
     <>
-      <div>
-        {isWasmLoaded && <p>Wasm Loaded</p>}
-        {!isWasmLoaded && <p>Wasm not Loaded</p>}
-      </div>
       <SectionBox title="Validating Admission Policy">
         <NameValueTable
           rows={[
@@ -50,7 +33,9 @@ export function ValidatingAdmissionPolicy() {
             },
             {
               name: 'Expression',
-              value: validatingAdmissionPolicy.spec.validations.map((v: any) => v.message).join(''),
+              value: validatingAdmissionPolicy.spec.validations
+                .map((v: any) => v.message)
+                .join(', '),
             },
           ]}
         />
@@ -61,16 +46,14 @@ export function ValidatingAdmissionPolicy() {
   );
 }
 
-function AdmissionEval(expr: string, object: string) {
+function AdmissionEval(policy: string, object: string, params: string) {
   return new Promise<string>(resolve => {
-    const res = window.AdmissionEval(expr, object);
+    const res = window.AdmissionEval(policy, object, params);
     resolve(res);
   });
 }
 
-function AdmissionEvaluator(props: { validatingAdmissionPolicy: any }) {
-  const { validatingAdmissionPolicy } = props;
-
+function cleanPolicyObject(validatingAdmissionPolicy: any): any {
   // strip status
   const strippedResource: any = Object.fromEntries(
     Object.entries(validatingAdmissionPolicy).filter(([key]) => key !== 'status')
@@ -85,83 +68,76 @@ function AdmissionEvaluator(props: { validatingAdmissionPolicy: any }) {
       ([key]) => key !== 'kubectl.kubernetes.io/last-applied-configuration'
     )
   );
+  return strippedResource;
+}
 
-  const [validatingAdmissionPolicyYAML, setValidatingAdmissionPolicyYAML] = useState(
-    yaml.dump(strippedResource)
-  );
-
-  const [resource, setResource] = useState(
-    `apiVersion: apps/v1
-kind: Deployment
-metadata:
-  annotations:
-    deployment.kubernetes.io/revision: "1"
-  creationTimestamp: "2023-10-02T15:26:06Z"
-  generation: 1
-  labels:
-    app: kubernetes-bootcamp
-  name: kubernetes-bootcamp
-  namespace: default
-  resourceVersion: "246826"
-  uid: dcdda63b-1611-467d-8927-43e3c73bc963
-spec:
-  progressDeadlineSeconds: 600
-  replicas: 1
-  revisionHistoryLimit: 10
-  selector:
-    matchLabels:
-      app: kubernetes-bootcamp
-  strategy:
-    rollingUpdate:
-      maxSurge: 25%
-      maxUnavailable: 25%
-    type: RollingUpdate
-  template:
-    metadata:
-      creationTimestamp: null
-      labels:
-        app: kubernetes-bootcamp
-    spec:
-      containers:
-      - image: gcr.io/google-samples/kubernetes-bootcamp:v1
-        imagePullPolicy: IfNotPresent
-        name: kubernetes-bootcamp
-        resources: {}
-        terminationMessagePath: /dev/termination-log
-        terminationMessagePolicy: File
-      dnsPolicy: ClusterFirst
-      restartPolicy: Always
-      schedulerName: default-scheduler
-      securityContext: {}
-      terminationGracePeriodSeconds: 30
-`.trim()
-  );
+function AdmissionEvaluator(props: { validatingAdmissionPolicy: any }) {
+  const { validatingAdmissionPolicy } = props;
+  const [params, setValidationParams] = useState(null);
   const [result, setResult] = useState('');
+  const policyEditorRef = useRef(null);
+  const resourceEditorRef = useRef(null);
 
-  const handleExpressionChange = (event: any) => {
-    setValidatingAdmissionPolicyYAML(event.target.value);
+  // Get params if defined
+  if (validatingAdmissionPolicy.spec.paramKind?.apiVersion) {
+    const pluralName = validatingAdmissionPolicy.spec.paramKind?.kind.toLowerCase() + 's';
+
+    useEffect(() => {
+      const groupVersion = validatingAdmissionPolicy.spec.paramKind?.apiVersion;
+      ApiProxy.request(`/apis/${groupVersion}/${pluralName}`).then((result: any) => {
+        setValidationParams(result.items[0]);
+      });
+    }, []);
+    if (!params) {
+      return <></>;
+    }
+  }
+
+  const submitEvaluation = async () => {
+    const output = await AdmissionEval(
+      policyEditorRef.current?.getValue(),
+      resourceEditorRef.current?.getValue(),
+      yaml.dump(params)
+    );
+    const yamlString = yaml.dump(JSON.parse(output));
+    setResult(yamlString);
   };
 
-  const handleResourceChange = (event: any) => {
-    setResource(event.target.value);
-  };
+  function handleMountPolicyEditor(editor: any) {
+    policyEditorRef.current = editor;
+    editor.onDidChangeModelContent(submitEvaluation);
+  }
 
-  const handleAdmissionClick = async () => {
-    const output = await AdmissionEval(validatingAdmissionPolicyYAML, resource);
-    setResult(output);
-  };
+  function handleMountResourceEditor(editor: any) {
+    resourceEditorRef.current = editor;
+    editor.onDidChangeModelContent(submitEvaluation);
+  }
 
   return (
-    <div>
-      <textarea
-        value={validatingAdmissionPolicyYAML}
-        onChange={handleExpressionChange}
-        rows={40}
-        cols={100}
-      />
-      <textarea value={resource} onChange={handleResourceChange} rows={40} cols={50} />
-      <textarea value={result} rows={20} cols={100} />
-      <button onClick={handleAdmissionClick}>Evaluate</button>
-    </div>
+    <>
+      <textarea value={result} rows={10} cols={100} readOnly />
+      <br />
+      <button onClick={submitEvaluation}>Evaluate</button>
+      <SectionBox paddingTop={2} title="Validating Admission Policy">
+        <Editor
+          language="yaml"
+          onMount={handleMountPolicyEditor}
+          theme={localStorage.headlampThemePreference === 'dark' ? 'vs-dark' : ''}
+          value={yaml.dump(cleanPolicyObject(validatingAdmissionPolicy))}
+          width={800}
+          height={600}
+        />
+      </SectionBox>
+      <SectionBox paddingTop={2} title="Resource">
+        <Editor
+          language="yaml"
+          onMount={handleMountResourceEditor}
+          theme={localStorage.headlampThemePreference === 'dark' ? 'vs-dark' : ''}
+          value={sampleDeployment}
+          width={800}
+          height={600}
+        />
+      </SectionBox>
+    </>
   );
 }

@@ -1,0 +1,8 @@
+node_modules
+.vscode
+dist
+hack 
+.eslintcache
+integration-test 
+kubescape-headlamp-plugin.code-workspace
+.code-workspace

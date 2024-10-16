@@ -3,6 +3,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"syscall/js"
 
@@ -20,21 +21,32 @@ func main() {
 	<-done
 }
 
-func admissionEval(this js.Value, args []js.Value) interface{} {
-	if len(args) < 2 {
-		return "Invalid no of arguments passed"
+func errorToJSON(err error) string {
+	results := vap.EvaluationResults{
+		Error: err.Error(),
+	}
+	data, _ := json.Marshal(results)
+	return string(data)
+}
+
+func admissionEval(this js.Value, args []js.Value) any {
+	if len(args) < 3 {
+		return errorToJSON(fmt.Errorf("Invalid no of arguments passed"))
 	}
 	policy := []byte(args[0].String())
 	resource := []byte(args[1].String())
-	evaluator, err := vap.NewAdmissionPolicyEvaluator(policy, []byte{}, resource, []byte{}, []byte{}, []byte{})
+	//request := args[1]
+	params := []byte(args[2].String())
+	//namespaceObject :=
+	evaluator, err := vap.NewAdmissionPolicyEvaluator(policy, resource, nil, nil, params, nil)
 	if err != nil {
 		fmt.Printf("unable to parse inputs %s\n", err)
-		return err.Error()
+		return errorToJSON(err)
 	}
 	result, err := evaluator.Evaluate()
 	if err != nil {
 		fmt.Printf("unable to validate admission policy %s\n", err)
-		return err.Error()
+		return errorToJSON(err)
 	}
 	return result
 }

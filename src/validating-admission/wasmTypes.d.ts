@@ -1,7 +1,7 @@
 declare global {
   export interface Window {
     Go: any;
-    AdmissionEval: (s1: string, s2: string) => string;
+    AdmissionEval: (policy: string, object: string, params: string) => string;
   }
 }
 export {};

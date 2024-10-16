@@ -27,16 +27,14 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
-var celProgramOptions = []cel.ProgramOption{
-	cel.EvalOptions(cel.OptOptimize, cel.OptTrackCost),
-}
-
 var celEnvOptions = []cel.EnvOption{
 	cel.EagerlyValidateDeclarations(true),
 	cel.DefaultUTCTimeZone(true),
 	ext.Strings(ext.StringsVersion(2)),
 	cel.CrossTypeNumericComparisons(true),
 	cel.OptionalTypes(),
+
+	// including the following dependencies breaks the WASM install. To many deps?
 	// library.URLs(),
 	// library.Regex(),
 	// library.Lists(),
@@ -51,44 +49,62 @@ type EvalResult struct {
 }
 
 type EvaluationResults struct {
+	Error            string        `json:"error,omitempty"`
 	Variables        []*EvalResult `json:"variables,omitempty"`
 	MatchConditions  []*EvalResult `json:"matchConditions,omitempty"`
 	Validations      []*EvalResult `json:"validations,omitempty"`
 	AuditAnnotations []*EvalResult `json:"auditAnnotations,omitempty"`
+
+	TypeChecking *TypeChecking `json:"typeChecking,omitempty"`
 }
 
+type ObjectData map[string]any
+
+// AdmissionPolicyEvaluator holds policy, data and results for a single validation run
 type AdmissionPolicyEvaluator struct {
-	policy         *ValidatingAdmissionPolicy
-	objectValue    map[string]any
-	oldObjectValue map[string]any
+	policy       ValidatingAdmissionPolicy
+	object       ObjectData
+	oldObject    ObjectData
+	paramsObject ObjectData
 
 	celEnvironment *cel.Env
 
 	results EvaluationResults
 }
 
-func NewAdmissionPolicyEvaluator(policyInput, oldObjectInput, objectValueInput, namespaceInput, requestInput, authorizerInput []byte) (*AdmissionPolicyEvaluator, error) {
+// 'object' - The object from the incoming request. The value is null for DELETE requests.
+// 'oldObject' - The existing object. The value is null for CREATE requests.
+// 'request' - Attributes of the admission request.
+// 'params' - Parameter resource referred to by the policy binding being evaluated. The value is null if ParamKind is not specified.
+// namespaceObject - The namespace, as a Kubernetes resource, that the incoming object belongs to. The value is null if the incoming object is cluster-scoped.
+// authorizer - A CEL Authorizer. May be used to perform authorization checks for the principal (authenticated user) of the request. See AuthzSelectors and Authz in the Kubernetes CEL library documentation for more details.
+// authorizer.requestResource - A shortcut for an authorization check configured with the request resource (group, resource, (subresource), namespace, name).
+func NewAdmissionPolicyEvaluator(policy, object, oldObject, request, params, namespace []byte) (*AdmissionPolicyEvaluator, error) {
 
 	evaluator := AdmissionPolicyEvaluator{
-		policy: &ValidatingAdmissionPolicy{},
+		results: EvaluationResults{TypeChecking: &TypeChecking{}},
 	}
 
-	if err := yaml.Unmarshal(policyInput, evaluator.policy); err != nil {
-		return nil, fmt.Errorf("failed to parse policy: %w", err)
+	if err := yaml.Unmarshal(policy, &evaluator.policy); err != nil {
+		return nil, fmt.Errorf("failed to parse policy YAML: %w", err)
 	}
 
-	if err := yaml.Unmarshal(oldObjectInput, &evaluator.oldObjectValue); err != nil {
-		return nil, fmt.Errorf("failed to parse old resource: %w", err)
+	if err := yaml.Unmarshal(object, &evaluator.object); err != nil {
+		return nil, fmt.Errorf("failed to parse object YAML: %w", err)
 	}
 
-	if err := yaml.Unmarshal(objectValueInput, &evaluator.objectValue); err != nil {
-		return nil, fmt.Errorf("failed to parse resource: %w", err)
+	if err := yaml.Unmarshal(oldObject, &evaluator.oldObject); err != nil {
+		return nil, fmt.Errorf("failed to parse oldObject YAML: %w", err)
+	}
+
+	if err := yaml.Unmarshal(params, &evaluator.paramsObject); err != nil {
+		return nil, fmt.Errorf("failed to parse params YAML: %w", err)
 	}
 
 	// Declare input data as variables
 	variables := []cel.EnvOption{
 		cel.Variable("object", cel.DynType),
-		cel.Variable("request", cel.DynType),
+		cel.Variable("params", cel.DynType),
 	}
 	// Declare additional variables
 	for _, variable := range evaluator.policy.Spec.Variables {
@@ -105,42 +121,17 @@ func NewAdmissionPolicyEvaluator(policyInput, oldObjectInput, objectValueInput, 
 	return &evaluator, nil
 }
 
-func (evaluator *AdmissionPolicyEvaluator) evalExpression(inputData map[string]any, variableName string, expression string) ref.Val {
-	ast, issues := evaluator.celEnvironment.Parse(expression)
-	if issues.Err() != nil {
-		log.Printf("Issues %v", issues.Err())
-		return types.WrapErr(issues.Err())
-	}
-
-	// ??  Checked: ERROR: <input>:1:1: undeclared reference to 'variables' (in container '') variables.isDeployment
-	// if _, issues := evaluator.celEnvironment.Check(ast); issues.Err() != nil {
-	// 	log.Printf("Checked: %v", issues.Err())
-	// 	return types.WrapErr(issues.Err())
-	// }
-	prog, err := evaluator.celEnvironment.Program(ast, celProgramOptions...)
-	if err != nil {
-		log.Printf("Program: %v", err)
-		return types.WrapErr(err)
-	}
-	val, _, err := prog.Eval(inputData)
-	if err != nil {
-		log.Printf("Eval %v", err)
-		return types.WrapErr(err)
-	}
-	return val
-}
-
 func (evaluator *AdmissionPolicyEvaluator) Evaluate() (string, error) {
 
 	// Input Variables
 	inputData := map[string]any{
-		"object":  evaluator.objectValue,
-		"request": evaluator.objectValue,
+		"object": evaluator.object,
+		"params": evaluator.paramsObject,
 	}
 
-	// Admission Policy variables
+	// Policy variables
 	for _, variable := range evaluator.policy.Spec.Variables {
-		value := evaluator.evalExpression(inputData, variable.Name, variable.Expression)
+		value := evaluator.evalExpression(inputData, variable.Expression)
 		inputData["variables."+variable.Name] = value
 		evaluator.results.Variables = append(evaluator.results.Variables, &EvalResult{
 			Name:   variable.Name,
@@ -148,48 +139,90 @@ func (evaluator *AdmissionPolicyEvaluator) Evaluate() (string, error) {
 		})
 	}
 
-	// Evaluate MatchConditions
+	// MatchConditions
 	for _, matchCondition := range evaluator.policy.Spec.MatchConditions {
-		value := evaluator.evalExpression(inputData, matchCondition.Name, matchCondition.Expression)
+		value := evaluator.evalExpression(inputData, matchCondition.Expression)
+		if types.IsUnknownOrError(value) {
+			if err, ok := value.Value().(error); ok {
+				warning := ExpressionWarning{
+					FieldRef: fmt.Sprintf("spec.matchConditions[%s].expression", matchCondition.Name),
+					Warning:  err.Error(),
+				}
+				evaluator.results.TypeChecking.ExpressionWarnings = append(evaluator.results.TypeChecking.ExpressionWarnings, warning)
+			}
+		}
 		evaluator.results.MatchConditions = append(evaluator.results.MatchConditions, &EvalResult{
 			Name:   matchCondition.Name,
 			Result: value,
 		})
 	}
 
+	// Validations
 	if isValidResult(evaluator.results.MatchConditions) {
-
-		// Validations
-		for _, validation := range evaluator.policy.Spec.Validations {
-			value := evaluator.evalExpression(inputData, "", validation.Expression)
-
+		for idx, validation := range evaluator.policy.Spec.Validations {
+			value := evaluator.evalExpression(inputData, validation.Expression)
 			evalResult := &EvalResult{
-				Name:   "",
+				Name:   fmt.Sprintf("spec.validations[%d].expression", idx),
 				Result: value,
 			}
-			if value.Value() != true {
-				if validation.Message != "" {
-					evalResult.Message = validation.Message
-				} else if validation.MessageExpression != "" {
-					evalResult.Message = evaluator.evalExpression(inputData, "", validation.Expression)
+
+			if types.IsUnknownOrError(value) {
+				if err, ok := evalResult.Result.Value().(error); ok {
+					warning := ExpressionWarning{
+						FieldRef: fmt.Sprintf("spec.validations[%d].expression", idx),
+						Warning:  err.Error(),
+					}
+					evaluator.results.TypeChecking.ExpressionWarnings = append(evaluator.results.TypeChecking.ExpressionWarnings, warning)
+				}
+			} else if value.Value() != true {
+				evalResult.Message = validation.Message
+
+				if evalResult.Message == "" && validation.MessageExpression != "" {
+					message := evaluator.evalExpression(inputData, validation.MessageExpression)
+					if !types.IsUnknownOrError(message) {
+						evalResult.Message = message
+					}
 				}
 			}
+
 			evaluator.results.Validations = append(evaluator.results.Validations, evalResult)
 		}
 
 		// AuditAnnotations
-		if isValidResult(evaluator.results.Validations) {
-			for _, auditAnnotation := range evaluator.policy.Spec.AuditAnnotations {
-				evalResult := evaluator.evalExpression(inputData, auditAnnotation.Key, auditAnnotation.ValueExpression)
-				evaluator.results.AuditAnnotations = append(evaluator.results.AuditAnnotations, &EvalResult{
-					Name:   auditAnnotation.Key,
-					Result: evalResult,
-				})
-			}
+		for _, auditAnnotation := range evaluator.policy.Spec.AuditAnnotations {
+			value := evaluator.evalExpression(inputData, auditAnnotation.ValueExpression)
+			evaluator.results.AuditAnnotations = append(evaluator.results.AuditAnnotations, &EvalResult{
+				Name:   auditAnnotation.Key,
+				Result: value,
+			})
 		}
+
 	}
 
-	return evaluator.generateResponse(inputData)
+	data, err := json.Marshal(evaluator.results)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func (evaluator *AdmissionPolicyEvaluator) evalExpression(inputData map[string]any, expression string) ref.Val {
+	ast, issues := evaluator.celEnvironment.Compile(expression)
+	if issues.Err() != nil {
+		log.Printf("Compile: %v", issues.String())
+		return types.WrapErr(issues.Err())
+	}
+	prog, err := evaluator.celEnvironment.Program(ast)
+	if err != nil {
+		log.Printf("Program: %v", err)
+		return types.WrapErr(err)
+	}
+	result, _, err := prog.Eval(inputData)
+	if err != nil {
+		log.Printf("Eval %v", err)
+		return types.WrapErr(err)
+	}
+	return result
 }
 
 func isValidResult(results []*EvalResult) bool {
@@ -199,28 +232,4 @@ func isValidResult(results []*EvalResult) bool {
 		}
 	}
 	return true
-}
-
-func unWrapErrors(evalResults []*EvalResult) {
-	for _, evalResult := range evalResults {
-		if types.IsUnknownOrError(evalResult.Result) {
-			if err, ok := evalResult.Result.Value().(error); ok {
-				evalResult.Error = err.Error()
-			}
-		}
-	}
-}
-
-func (evaluator *AdmissionPolicyEvaluator) generateResponse(inputData map[string]any) (string, error) {
-
-	unWrapErrors(evaluator.results.Variables)
-	unWrapErrors(evaluator.results.MatchConditions)
-	unWrapErrors(evaluator.results.Validations)
-	unWrapErrors(evaluator.results.AuditAnnotations)
-
-	data, err := json.Marshal(evaluator.results)
-	if err != nil {
-		return "", err
-	}
-	return string(data), nil
 }

@@ -45,3 +45,15 @@ registerRoute({
   exact: true,
   name: 'Validation Admission Policies',
 });
+
+async function loadWasm(): Promise<void> {
+  const goWasm = new window.Go();
+  const result = await WebAssembly.instantiateStreaming(
+    fetch('/plugins/vap-plugin/main.wasm'),
+    goWasm.importObject
+  );
+  goWasm.run(result.instance);
+  //setIsWasmLoaded(true);
+}
+
+loadWasm();
